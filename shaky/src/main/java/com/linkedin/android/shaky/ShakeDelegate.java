@@ -218,6 +218,18 @@ public abstract class ShakeDelegate {
     }
 
     /**
+     * Controls whether the windows captured by {@link #enableMultiWindowCapture()} are flattened
+     * into a single screenshot, so the feedback carries one image of what the user saw instead of
+     * one attachment per window. Has no effect unless multi-window capture is also enabled.
+     *
+     * @return true to flatten the captured windows into one screenshot, false to attach each
+     * window separately (default)
+     */
+    public boolean enableMultiWindowCompositing() {
+        return false;
+    }
+
+    /**
      * Called when the user submits the Feedback form. Creates and starts an email Intent.
      * This method can be overridden to send data to a custom URL endpoint, etc.
      */

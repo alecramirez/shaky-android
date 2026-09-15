@@ -19,6 +19,8 @@ import android.app.Activity;
 import android.content.Context;
 import android.content.ContextWrapper;
 import android.graphics.Bitmap;
+import android.graphics.Canvas;
+import android.graphics.Color;
 import android.graphics.Rect;
 import android.os.Build;
 import android.os.Handler;
@@ -49,12 +51,16 @@ import java.util.concurrent.atomic.AtomicInteger;
  * and Coil-loaded images which create GPU-stored bitmaps.
  *
  * Captures each window separately (activity, dialogs, bottom sheets) by reflecting into
- * WindowManager's internal data structures to enumerate all root views.
+ * WindowManager's internal data structures to enumerate all root views. The per-window bitmaps are
+ * either returned as-is or flattened into a single screenshot.
  *
  * Requirements: Android API 26+ (PixelCopy API)
  */
 final class MultiWindowScreenshotCapture {
     private static final String TAG = "MultiWindowCapture";
+
+    /** Max 8-bit alpha, which a window's dimAmount (0f..1f) scales to. */
+    private static final int MAX_ALPHA = 0xFF;
 
     private MultiWindowScreenshotCapture() {
     }
@@ -66,9 +72,12 @@ final class MultiWindowScreenshotCapture {
      * Callback is invoked on main thread when all captures complete.
      *
      * @param activity the activity to capture screenshots from
+     * @param flatten  true to composite the windows into a single screenshot, so the callback
+     *                 receives one bitmap instead of one per window
      * @param callback receives list of bitmaps (one per window), or null if all captures failed
      */
     static void captureMultipleAsync(@NonNull Activity activity,
+                                     boolean flatten,
                                      @NonNull MultiBitmapCallback callback
     ) {
         final List<ViewRootData> rootViews = getRootViews(activity);
@@ -92,7 +101,7 @@ final class MultiWindowScreenshotCapture {
                 windowForView = activity.getWindow();
             }
 
-            captureAsync(rootView, windowForView, new CaptureCallback() {
+            captureAsync(rootView, windowForView, flatten, new CaptureCallback() {
                 @Override
                 public void onCaptureComplete(Bitmap bitmap) {
                     bitmaps[index] = bitmap;
@@ -103,17 +112,87 @@ final class MultiWindowScreenshotCapture {
                     }
 
                     if (completed == rootViews.size()) {
+                        List<ViewRootData> capturedRoots = new ArrayList<>();
                         List<Bitmap> bitmapList = new ArrayList<>();
-                        for (Bitmap bmp : bitmaps) {
-                            if (bmp != null) {
-                                bitmapList.add(bmp);
+                        for (int i = 0; i < bitmaps.length; i++) {
+                            if (bitmaps[i] != null) {
+                                capturedRoots.add(rootViews.get(i));
+                                bitmapList.add(bitmaps[i]);
                             }
                         }
 
-                        callback.onCaptureComplete(bitmapList.isEmpty() ? null : bitmapList);
+                        if (bitmapList.isEmpty()) {
+                            callback.onCaptureComplete(null);
+                        } else {
+                            callback.onCaptureComplete(
+                                    flatten ? composite(capturedRoots, bitmapList) : bitmapList);
+                        }
                     }
                 }
             });
+        }
+    }
+
+    /**
+     * Draws the per-window bitmaps back-to-front, in list order, into a single bitmap sized to
+     * hold them all, recycling the sources as it goes. Each window above the base layer is
+     * preceded by the dim it casts on everything behind it, since the window manager draws that
+     * dim outside of any window's surface and PixelCopy therefore never sees it.
+     *
+     * @param rootViews the windows that were captured, ordered back-to-front
+     * @param bitmaps   the bitmap captured for each of those windows, never empty
+     * @return the composited screenshot as a single-element list, or null if the windows could
+     * not be composited
+     */
+    @Nullable
+    private static List<Bitmap> composite(@NonNull List<ViewRootData> rootViews,
+                                          @NonNull List<Bitmap> bitmaps) {
+        final Rect bounds = new Rect();
+        for (ViewRootData rootView : rootViews) {
+            bounds.union(rootView._screenFrame);
+        }
+
+        Bitmap composited = null;
+        try {
+            composited =
+                    Bitmap.createBitmap(bounds.width(), bounds.height(), Bitmap.Config.ARGB_8888);
+            Canvas canvas = new Canvas(composited);
+
+            for (int i = 0; i < bitmaps.size(); i++) {
+                // Nothing is behind the first window drawn, so it never needs a scrim beneath it.
+                if (i > 0) {
+                    drawScrim(canvas, rootViews.get(i)._layoutParams);
+                }
+
+                Rect frame = rootViews.get(i)._screenFrame;
+                canvas.drawBitmap(bitmaps.get(i),
+                        frame.left - bounds.left,
+                        frame.top - bounds.top,
+                        null);
+            }
+
+            Log.i(TAG, "Composited " + bitmaps.size() + " window(s) into one screenshot");
+            return Collections.singletonList(composited);
+        } catch (RuntimeException | OutOfMemoryError throwable) {
+            // Compositing allocates far more than any single window, so failing here degrades to
+            // the caller's fallback rather than crashing the host app.
+            Log.e(TAG, "Failed to composite windows", throwable);
+            if (composited != null) {
+                composited.recycle();
+            }
+            return null;
+        } finally {
+            for (Bitmap bitmap : bitmaps) {
+                bitmap.recycle();
+            }
+        }
+    }
+
+    private static void drawScrim(@NonNull Canvas canvas,
+                                  @NonNull WindowManager.LayoutParams layoutParams) {
+        if ((layoutParams.flags & WindowManager.LayoutParams.FLAG_DIM_BEHIND) != 0
+                && layoutParams.dimAmount > 0) {
+            canvas.drawColor(Color.argb((int) (layoutParams.dimAmount * MAX_ALPHA), 0, 0, 0));
         }
     }
 
@@ -158,12 +237,14 @@ final class MultiWindowScreenshotCapture {
      * Captures a screenshot of a view using the associated window.
      * Uses PixelCopy API (Android O+) for hardware bitmap support.
      *
-     * @param viewRootData information about the view root to capture
-     * @param window       the window containing the view
-     * @param callback     callback to receive the captured bitmap
+     * @param viewRootData       information about the view root to capture
+     * @param window             the window containing the view
+     * @param cropToWindowBounds true to copy only the window's own region of its surface
+     * @param callback           callback to receive the captured bitmap
      */
     private static void captureAsync(@NonNull ViewRootData viewRootData,
                                      @Nullable Window window,
+                                     boolean cropToWindowBounds,
                                      @NonNull CaptureCallback callback) {
         final View view = viewRootData._view.getRootView();
 
@@ -186,14 +267,25 @@ final class MultiWindowScreenshotCapture {
 
         if (surface != null && surface.isValid()) {
             // Use Surface directly - captures specific window (activity/dialog/bottom sheet)
-            PixelCopy.request(surface, bitmap, copyResult -> {
+            PixelCopy.OnPixelCopyFinishedListener listener = copyResult -> {
                 if (copyResult == PixelCopy.SUCCESS) {
                     callback.onCaptureComplete(bitmap);
                 } else {
                     Log.e(TAG, "PixelCopy from Surface failed with result: " + copyResult);
                     callback.onCaptureComplete(null);
                 }
-            }, new Handler(Looper.getMainLooper()));
+            };
+            Handler handler = new Handler(Looper.getMainLooper());
+            // A null source rect copies the whole surface, which is what the per-window path wants.
+            Rect sourceRect = cropToWindowBounds ? windowBoundsInSurface(view) : null;
+
+            try {
+                PixelCopy.request(surface, sourceRect, bitmap, listener, handler);
+            } catch (IllegalArgumentException exception) {
+                // Copying the whole surface still yields an image, just a scaled one.
+                Log.w(TAG, "PixelCopy rejected source rect " + sourceRect, exception);
+                PixelCopy.request(surface, null, bitmap, listener, handler);
+            }
         } else {
             // Fallback to Window
             PixelCopy.request(window, bitmap, copyResult -> {
@@ -205,6 +297,31 @@ final class MultiWindowScreenshotCapture {
                 }
             }, new Handler(Looper.getMainLooper()));
         }
+    }
+
+    /**
+     * The region of a window's surface that the window itself occupies.
+     * <p>
+     * A window reserves a margin around its frame for what it draws outside it, such as the drop
+     * shadow under a dialog or bottom sheet, so its surface is larger than the window. Copying the
+     * whole surface into a bitmap sized to the window scales that margin in, shrinking the window
+     * toward the centre of the image; copying only this region keeps it 1:1.
+     *
+     * @param view the window's root view
+     * @return the region to copy, or null to copy the whole surface
+     */
+    @Nullable
+    private static Rect windowBoundsInSurface(@NonNull View view) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+            return null;
+        }
+
+        int[] location = new int[2];
+        view.getLocationInSurface(location);
+        return new Rect(location[0],
+                location[1],
+                location[0] + view.getWidth(),
+                location[1] + view.getHeight());
     }
 
     /**
@@ -252,6 +369,8 @@ final class MultiWindowScreenshotCapture {
             int width = rootView.getWidth();
             int height = rootView.getHeight();
 
+            Rect screenFrame = new Rect(left, top, left + width, top + height);
+
             // For dialogs/bottom sheets, find actual content bounds
             if (layoutParams.type == WindowManager.LayoutParams.TYPE_APPLICATION) {
                 View contentView = findBottomSheetContent(rootView, 0);
@@ -266,7 +385,7 @@ final class MultiWindowScreenshotCapture {
             }
 
             Rect area = new Rect(left, top, left + width, top + height);
-            rootViews.add(new ViewRootData(rootView, area, layoutParams, root));
+            rootViews.add(new ViewRootData(rootView, area, layoutParams, root, screenFrame));
         }
 
         return rootViews;
@@ -389,14 +508,16 @@ final class MultiWindowScreenshotCapture {
         final Rect _originalWinFrame;
         final WindowManager.LayoutParams _layoutParams;
         final Object _viewRoot;
+        final Rect _screenFrame;
 
         ViewRootData(View view, Rect winFrame, WindowManager.LayoutParams layoutParams,
-                     Object viewRoot) {
+                     Object viewRoot, Rect screenFrame) {
             _view = view;
             _winFrame = winFrame;
             _originalWinFrame = new Rect(winFrame);
             _layoutParams = layoutParams;
             _viewRoot = viewRoot;
+            _screenFrame = screenFrame;
         }
 
         /**

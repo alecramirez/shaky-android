@@ -378,7 +378,8 @@ public class Shaky implements ShakeDetector.Listener {
      * 1. `Falcon` - Fast single-bitmap capture of the entire screen (Canvas-based). However, fails
      * if UI contains hardware bitmaps.
      * 2. If {@link ShakeDelegate#enableMultiWindowCapture()} is enabled:
-     *    - `PixelCopy` multi-window - Captures each window separately to handle hardware bitmaps.
+     *    - `PixelCopy` multi-window - Captures each window separately to handle hardware bitmaps,
+     *      flattened into one screenshot if {@link ShakeDelegate#enableMultiWindowCompositing()}.
      *    - Falls back to {@link Utils#capture} if PixelCopy fails.
      * 3. If multi-window capture is disabled (default):
      *    - {@link Utils#capture} fallback - Main activity only.
@@ -397,7 +398,8 @@ public class Shaky implements ShakeDetector.Listener {
         // Falcon failed - check if multi-window capture is enabled
         if (delegate.enableMultiWindowCapture()) {
             // Use PixelCopy to capture all windows separately
-            MultiWindowScreenshotCapture.captureMultipleAsync(activity, (List<Bitmap> bitmaps) -> {
+            MultiWindowScreenshotCapture.captureMultipleAsync(activity,
+                    delegate.enableMultiWindowCompositing(), (List<Bitmap> bitmaps) -> {
                 if (bitmaps != null && !bitmaps.isEmpty()) {
                     Log.i(TAG, "PixelCopy captured " + bitmaps.size() + " screenshot(s)");
                     // Convert List to array for CollectDataTask
